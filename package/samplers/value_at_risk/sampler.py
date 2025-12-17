@@ -406,6 +406,96 @@ class RobustGPSampler(BaseSampler):
                 **noise_kwargs,
             )
 
+    def _get_worst_case_scorer(
+        self,
+        gpr: gp.GPRegressor,
+        internal_search_space: gp_search_space.SearchSpace,
+        search_space: dict[str, BaseDistribution],
+        const_noisy_param_values: dict[str, float],
+        constraints_gpr_list: list[gp.GPRegressor] | None = None,
+        constraints_threshold_list: list[float] | None = None,
+    ) -> WorstCaseScorer:
+        def _get_scaled_input_noise_params(
+            input_noise_params: dict[str, float], noise_param_name: str
+        ) -> torch.Tensor:
+            if not (input_noise_params.keys() <= search_space.keys()):
+                raise KeyError(
+                    f"param names in {noise_param_name} must be in {list(search_space.keys())}."
+                )
+            discrete_dists = (
+                optuna.distributions.CategoricalDistribution,
+                optuna.distributions.IntDistribution,
+            )
+            scaled_input_noise_params = torch.zeros(len(search_space), dtype=torch.float64)
+            for i, (param_name, dist) in enumerate(search_space.items()):
+                if param_name not in input_noise_params:
+                    continue
+                err_msg = f"Cannot add input noise to discrete parameter '{param_name}'."
+                if isinstance(dist, discrete_dists):
+                    raise ValueError(err_msg)
+                assert isinstance(dist, optuna.distributions.FloatDistribution)
+                if dist.step is not None:
+                    raise ValueError(err_msg)
+                elif dist.log:
+                    raise ValueError(
+                        f"Cannot add input noise to log-scaled parameter '{param_name}'."
+                    )
+                input_noise_param = input_noise_params[param_name]
+                scaled_input_noise_params[i] = input_noise_param / (dist.high - dist.low)
+            return scaled_input_noise_params
+
+        noise_kwargs: _NoiseKWArgs = {}
+        const_noise_param_inds = [
+            i
+            for i, param_name in enumerate(search_space)
+            if param_name in self._const_noisy_param_names
+        ]
+
+        def normalize(dist: BaseDistribution, x: float) -> float:
+            assert isinstance(
+                dist,
+                (optuna.distributions.IntDistribution, optuna.distributions.FloatDistribution),
+            )
+            return (x - dist.low) / (dist.high - dist.low)
+
+        const_noisy_param_normalized_values = [
+            normalize(dist, const_noisy_param_values[param_name])
+            if param_name in const_noisy_param_values
+            else 0.5
+            for i, (param_name, dist) in enumerate(search_space.items())
+            if param_name in self._const_noisy_param_names
+        ]
+
+        if self._uniform_input_noise_rads is not None:
+            scaled_input_noise_params = _get_scaled_input_noise_params(
+                self._uniform_input_noise_rads, "uniform_input_noise_rads"
+            )
+            # FIXME(sakai): If the fixed value is not at the center of the range,
+            # \pm 0.5 may not cover the domain.
+            scaled_input_noise_params[const_noise_param_inds] = 0.5
+            noise_kwargs["uniform_input_noise_rads"] = scaled_input_noise_params
+        elif self._normal_input_noise_stdevs is not None:
+            scaled_input_noise_params = _get_scaled_input_noise_params(
+                self._normal_input_noise_stdevs, "normal_input_noise_stdevs"
+            )
+            # NOTE(nabenabe): \pm 2 sigma will cover the domain.
+            # FIXME(sakai): If the fixed value is not at the center of the range,
+            # \pm 2 sigma may not cover the domain.
+            scaled_input_noise_params[const_noise_param_inds] = 0.25
+            noise_kwargs["normal_input_noise_stdevs"] = scaled_input_noise_params
+        else:
+            assert False, "Should not reach here."
+
+        return WorstCaseScorer(
+            gpr=gpr,
+            constraints_gpr_list=constraints_gpr_list,
+            constraints_threshold_list=constraints_threshold_list,
+            n_input_noise_samples=self._n_input_noise_samples,
+            fixed_indices=torch.tensor(const_noise_param_inds, dtype=torch.int64),
+            fixed_values=torch.tensor(const_noisy_param_normalized_values, dtype=torch.float64),
+            **noise_kwargs,
+        )
+
     def _verify_search_space(self, search_space: dict[str, BaseDistribution]) -> None:
         noisy_param_cands = [
             k
@@ -597,7 +687,20 @@ class RobustGPSampler(BaseSampler):
         )
         gpr = self._get_gpr_list(study, search_space)[0]
         internal_search_space = gp_search_space.SearchSpace(search_space)
-        X_train = internal_search_space.get_normalized_params(trials)
+        if self._nominal_ranges:
+            X_train = internal_search_space.get_normalized_params(
+                [
+                    optuna.create_trial(
+                        params=self.get_nominal_params(trial),
+                        distributions=trial.distributions,
+                        values=trial.values,
+                        state=trial.state,
+                    )
+                    for trial in trials
+                ]
+            )
+        else:
+            X_train = internal_search_space.get_normalized_params(trials)
         acqf: acqf_module.BaseAcquisitionFunc
         if self._constraints_func is None:
             acqf = self._get_value_at_risk(
@@ -627,6 +730,59 @@ class RobustGPSampler(BaseSampler):
 
         best_idx = np.argmax(acqf.eval_acqf_no_grad(X_train)).item()
         return trials[best_idx]
+
+    def get_robust_trial_worst_case(
+        self, study: Study, const_noisy_param_nominal_values: dict[str, float] | None = None
+    ) -> FrozenTrial:
+        states = (TrialState.COMPLETE,)
+        trials = study._get_trials(deepcopy=False, states=states, use_cache=True)
+        search_space = self._get_nominal_search_space(
+            self.infer_relative_search_space(study, trials[0])
+        )
+        gpr = self._get_gpr_list(study, search_space)[0]
+        internal_search_space = gp_search_space.SearchSpace(search_space)
+        if self._nominal_ranges:
+            X_train = internal_search_space.get_normalized_params(
+                [
+                    optuna.create_trial(
+                        params=self.get_nominal_params(trial),
+                        distributions=trial.distributions,
+                        values=trial.values,
+                        state=trial.state,
+                    )
+                    for trial in trials
+                ]
+            )
+        else:
+            X_train = internal_search_space.get_normalized_params(trials)
+        assert (
+            self._constraints_func is not None
+        ), "Worst-case robust trial requires constraints_func."
+        constraint_vals, _ = _get_constraint_vals_and_feasibility(study, trials)
+        constr_gpr_list, constr_threshold_list = self._get_constraints_acqf_args(
+            constraint_vals,
+            internal_search_space,
+            internal_search_space.get_normalized_params(trials),
+        )
+        scorer = self._get_worst_case_scorer(
+            gpr,
+            internal_search_space,
+            search_space,
+            constraints_gpr_list=constr_gpr_list,
+            constraints_threshold_list=constr_threshold_list,
+            const_noisy_param_values=const_noisy_param_nominal_values or {},
+        )
+
+        trial_scores = []
+        for nominal_params, trial in zip(X_train, trials):
+            worst_feasible_prob, worst_objective_value = scorer.score_trial(
+                torch.tensor(nominal_params, dtype=torch.float64)
+            )
+            trial_scores.append((worst_feasible_prob, worst_objective_value, trial))
+
+        trial_scores.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        return trial_scores[0][2]
 
     def get_robust_params(
         self, study: Study, const_noisy_param_nominal_values: dict[str, float] | None = None
@@ -693,3 +849,71 @@ def _get_constraint_vals_and_feasibility(
     is_feasible = np.all(constraint_vals <= 0, axis=1)
     assert not isinstance(is_feasible, np.bool_), "MyPy Redefinition for NumPy v2.2.0."
     return constraint_vals, is_feasible
+
+
+class WorstCaseScorer:
+    def __init__(
+        self,
+        gpr: gp.GPRegressor,
+        constraints_gpr_list: list[gp.GPRegressor] | None,
+        constraints_threshold_list: list[float] | None,
+        n_input_noise_samples: int,
+        uniform_input_noise_rads: torch.Tensor | None = None,
+        normal_input_noise_stdevs: torch.Tensor | None = None,
+        qmc_seed: int | None = None,
+        fixed_indices: torch.Tensor | None = None,
+        fixed_values: torch.Tensor | None = None,
+        stabilizing_noise: float = 1e-12,
+    ):
+        self._gpr_objective = gpr
+        self._constraints_gpr_list = constraints_gpr_list
+        self._constraints_threshold_list = constraints_threshold_list
+        self._stabilizing_noise = stabilizing_noise
+        self._fixed_indices = fixed_indices
+        self._fixed_values = fixed_values
+
+        # Sample input noise
+        self._input_noise = acqf_module._sample_input_noise(
+            n_input_noise_samples,
+            uniform_input_noise_rads,
+            normal_input_noise_stdevs,
+            seed=qmc_seed,
+        )
+
+    def score_trial(self, nominal_params: torch.Tensor) -> tuple[float, float]:
+        """
+        Score a trial based on the worst-case feasible probability and objective value.
+
+        Args:
+            nominal_params: The nominal parameter values of the trial.
+
+        Returns:
+            A tuple of (worst_feasible_prob, worst_objective_value).
+        """
+        # Add noise to the nominal parameters
+        noisy_params = nominal_params.unsqueeze(-2) + self._input_noise
+
+        # Apply fixed parameters if provided
+        if self._fixed_indices is not None and self._fixed_values is not None:
+            noisy_params[..., self._fixed_indices] = self._fixed_values
+
+        # Calculate feasible probabilities
+        log_feas_probs = torch.zeros(noisy_params.shape[:-1], dtype=torch.float64)
+        if self._constraints_gpr_list is not None and self._constraints_threshold_list is not None:
+            for constr_gpr, threshold in zip(
+                self._constraints_gpr_list, self._constraints_threshold_list
+            ):
+                means, vars_ = constr_gpr.posterior(noisy_params)
+                sigmas = torch.sqrt(vars_ + self._stabilizing_noise)
+                log_feas_probs += torch.special.log_ndtr((means - threshold) / sigmas)
+        else:
+            log_feas_probs = torch.zeros(noisy_params.shape[:-1], dtype=torch.float64)
+
+        # Compute worst-case feasible probability
+        worst_feasible_prob = log_feas_probs.min().item()
+
+        # Calculate objective values
+        means, _ = self._gpr_objective.posterior(noisy_params)
+        worst_objective_value = means.min().item()
+
+        return worst_feasible_prob, worst_objective_value
